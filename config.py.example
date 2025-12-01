@@ -1,0 +1,259 @@
+"""
+Configuration management for Stretch Ceiling Bot
+ENHANCED: Dynamics 365 integration configuration
+"""
+import os
+import logging
+from typing import List
+from dotenv import load_dotenv
+
+# Load environment variables
+try:
+    load_dotenv()
+    print("✅ Environment variables loaded from .env file")
+except ImportError:
+    print("⚠️ python-dotenv not installed. Using system environment variables.")
+
+# Security Filter for logging
+class SensitiveDataFilter(logging.Filter):
+    """Filter to redact sensitive data from logs while preserving data types"""
+    
+    def __init__(self):
+        super().__init__()
+        self.patterns = [
+            (r"bot\d+:[A-Za-z0-9_-]{35,}", "[BOT_TOKEN]"),
+            (r"Bearer [A-Za-z0-9_-]+", "[BEARER_TOKEN]"),
+            (r"password=[^&\s]+", "password=[REDACTED]"),
+            (r"AAF[A-Za-z0-9_-]{33,}", "[TELEGRAM_TOKEN]"),
+            (r"[a-zA-Z0-9]{8}Q~[a-zA-Z0-9._~-]{32,}", "[CLIENT_SECRET]"),
+            (r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "[UUID]"),
+        ]
+    
+    def filter(self, record):
+        import re
+        if hasattr(record, "msg"):
+            msg = str(record.msg)
+            for pattern, replacement in self.patterns:
+                msg = re.sub(pattern, replacement, msg)
+            record.msg = msg
+        
+        if hasattr(record, "args") and record.args:
+            new_args = []
+            for arg in record.args:
+                if isinstance(arg, str):
+                    new_arg = arg
+                    for pattern, replacement in self.patterns:
+                        new_arg = re.sub(pattern, replacement, new_arg)
+                    new_args.append(new_arg)
+                else:
+                    new_args.append(arg)
+            record.args = tuple(new_args)
+        
+        return True
+
+# Enhanced logging setup
+def setup_logging():
+    log_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper())
+    log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    
+    sensitive_filter = SensitiveDataFilter()
+    
+    handlers = []
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter(log_format))
+    console_handler.addFilter(sensitive_filter)
+    handlers.append(console_handler)
+    
+    if os.getenv("LOG_TO_FILE", "true").lower() == "true":
+        log_file = os.getenv("LOG_FILE", "enhanced_multi_ceiling_bot.log")
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(logging.Formatter(log_format))
+        file_handler.addFilter(sensitive_filter)
+        handlers.append(file_handler)
+    
+    debug_handler = logging.FileHandler("bot_debug.log")
+    debug_handler.setFormatter(logging.Formatter(log_format))
+    debug_handler.setLevel(logging.DEBUG)
+    debug_handler.addFilter(sensitive_filter)
+    handlers.append(debug_handler)
+    
+    logging.basicConfig(level=log_level, format=log_format, handlers=handlers)
+    
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("telegram").setLevel(logging.INFO)
+    logging.getLogger("telegram.ext").setLevel(logging.INFO)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("msal").setLevel(logging.INFO)
+
+# Configuration class
+class Config:
+    """Configuration management with Dynamics 365 integration"""
+    
+    @staticmethod
+    def get_database_config():
+        config = {
+            "host": os.getenv("MYSQL_HOST", "localhost"),
+            "database": os.getenv("MYSQL_DB", "stretch_ceiling_bot"),
+            "user": os.getenv("MYSQL_USER", "root"),
+            "password": os.getenv("MYSQL_PASSWORD", ""),
+            "port": int(os.getenv("MYSQL_PORT", "3306")),
+            "charset": "utf8mb4",
+            "autocommit": True,
+            "connect_timeout": 20,
+            "ssl": {"fake_flag_to_enable_tls": True},
+        }
+        return config
+    
+    # Bot configuration
+    BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    
+    # Azure OpenAI configuration
+    AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+    AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+    AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
+    DEPLOYMENT_NAME = os.getenv("DEPLOYMENT_NAME", "gpt-4.1-nano")
+    
+    # Entra ID Configuration for Email
+    AZURE_TENANT_ID = os.getenv("AZURE_TENANT_ID", "53a74225-a02a-4073-958e-57c31880e64b")
+    AZURE_CLIENT_ID = os.getenv("AZURE_CLIENT_ID", "623d7bd2-b256-4ecd-8234-d316afbc9357")
+    AZURE_CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET", """")
+    EMAIL_FROM = os.getenv("EMAIL_FROM", "assistant_quotes@stretchgroup.be")
+    
+    # Microsoft Graph API endpoint
+    GRAPH_API_ENDPOINT = "https://graph.microsoft.com/v1.0"
+    
+    # Dynamics 365 Configuration
+    DYNAMICS_URL = os.getenv("DYNAMICS_URL", "https://yourorg.crm4.dynamics.com")
+    DYNAMICS_TENANT_ID = os.getenv("DYNAMICS_TENANT_ID", AZURE_TENANT_ID)  # Can reuse if same tenant
+    DYNAMICS_CLIENT_ID = os.getenv("DYNAMICS_CLIENT_ID")  # App registration for Dynamics
+    DYNAMICS_CLIENT_SECRET = os.getenv("DYNAMICS_CLIENT_SECRET")
+    ENABLE_DYNAMICS_SYNC = os.getenv("ENABLE_DYNAMICS_SYNC", "true").lower() == "true"
+    
+    # Dynamics sync settings
+    DYNAMICS_SYNC_QUOTES = os.getenv("DYNAMICS_SYNC_QUOTES", "true").lower() == "true"
+    DYNAMICS_SYNC_USERS = os.getenv("DYNAMICS_SYNC_USERS", "true").lower() == "true"
+    DYNAMICS_CREATE_ACTIVITIES = os.getenv("DYNAMICS_CREATE_ACTIVITIES", "true").lower() == "true"
+    
+    # Dynamics entity mappings
+    DYNAMICS_QUOTE_ENTITY = os.getenv("DYNAMICS_QUOTE_ENTITY", "quotes")
+    DYNAMICS_CONTACT_ENTITY = os.getenv("DYNAMICS_CONTACT_ENTITY", "contacts")
+    DYNAMICS_ACCOUNT_ENTITY = os.getenv("DYNAMICS_ACCOUNT_ENTITY", "accounts")
+    DYNAMICS_ACTIVITY_ENTITY = os.getenv("DYNAMICS_ACTIVITY_ENTITY", "tasks")
+    
+    # Dynamics sync intervals (in seconds)
+    DYNAMICS_SYNC_INTERVAL = int(os.getenv("DYNAMICS_SYNC_INTERVAL", "300"))  # 5 minutes
+    DYNAMICS_RETRY_INTERVAL = int(os.getenv("DYNAMICS_RETRY_INTERVAL", "60"))  # 1 minute
+    DYNAMICS_MAX_RETRIES = int(os.getenv("DYNAMICS_MAX_RETRIES", "3"))
+    
+    # Company settings
+    COMPANY_NAME = os.getenv("COMPANY_NAME", "Stretch Group")
+    COMPANY_EMAIL = os.getenv("COMPANY_EMAIL", "info@stretchgroup.be")
+    COMPANY_PHONE = os.getenv("COMPANY_PHONE", "+32 485 48 30 35")
+    COMPANY_ADDRESS = os.getenv("COMPANY_ADDRESS", "Your Company Address")
+    COMPANY_WEBSITE = os.getenv("COMPANY_WEBSITE", "https://stretchgroup.be")
+    
+    # Company branding
+    COMPANY_PRIMARY_COLOR = os.getenv("COMPANY_PRIMARY_COLOR", "#E30613")
+    COMPANY_SECONDARY_COLOR = os.getenv("COMPANY_SECONDARY_COLOR", "#000000")
+    COMPANY_LOGO_PATH = os.getenv("COMPANY_LOGO_PATH", "stretch_logo.png")
+    
+    # Quote settings
+    QUOTE_VALIDITY_DAYS = int(os.getenv("QUOTE_VALIDITY_DAYS", "30"))
+    MAX_CEILINGS_PER_QUOTE = int(os.getenv("MAX_CEILINGS_PER_QUOTE", "10"))
+    QUOTE_SESSION_TIMEOUT_HOURS = int(os.getenv("QUOTE_SESSION_TIMEOUT_HOURS", "2"))
+    
+    # Admin settings
+    ADMIN_USER_IDS = [int(id.strip()) for id in os.getenv("ADMIN_USER_IDS", "").split(",") if id.strip()]
+    
+    # PDF settings
+    PDF_OUTPUT_DIR = os.getenv("PDF_OUTPUT_DIR", "/tmp/quotes")
+    
+    # Features
+    ENABLE_PDF_GENERATION = os.getenv("ENABLE_PDF_GENERATION", "true").lower() == "true"
+    ENABLE_EMAIL_SENDING = os.getenv("ENABLE_EMAIL_SENDING", "true").lower() == "true"
+    ENABLE_AI_CHAT = os.getenv("ENABLE_AI_CHAT", "true").lower() == "true"
+    
+    # WhatsApp Integration (future)
+    WHATSAPP_API_URL = os.getenv("WHATSAPP_API_URL")
+    WHATSAPP_API_TOKEN = os.getenv("WHATSAPP_API_TOKEN")
+    WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+    
+    # Development settings
+    DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+    
+    @staticmethod
+    def validate_config():
+        """Validate configuration including Dynamics 365 settings"""
+        errors = []
+        
+        db_config = Config.get_database_config()
+        required_db_fields = ["host", "database", "user", "password"]
+        for field in required_db_fields:
+            if not db_config.get(field):
+                errors.append(f"Missing required database configuration: {field.upper()}")
+        
+        if not Config.BOT_TOKEN:
+            errors.append("Missing required TELEGRAM_BOT_TOKEN")
+        
+        # Validate Entra ID configuration
+        if Config.ENABLE_EMAIL_SENDING:
+            if not Config.AZURE_TENANT_ID:
+                errors.append("Missing required AZURE_TENANT_ID for email")
+            if not Config.AZURE_CLIENT_ID:
+                errors.append("Missing required AZURE_CLIENT_ID for email")
+            if not Config.AZURE_CLIENT_SECRET:
+                errors.append("Missing required AZURE_CLIENT_SECRET for email")
+            if not Config.EMAIL_FROM:
+                errors.append("Missing required EMAIL_FROM for email")
+        
+        # Validate Dynamics 365 configuration
+        if Config.ENABLE_DYNAMICS_SYNC:
+            if not Config.DYNAMICS_URL:
+                errors.append("Missing required DYNAMICS_URL for Dynamics 365")
+            if not Config.DYNAMICS_CLIENT_ID:
+                errors.append("Missing required DYNAMICS_CLIENT_ID for Dynamics 365")
+            if not Config.DYNAMICS_CLIENT_SECRET:
+                errors.append("Missing required DYNAMICS_CLIENT_SECRET for Dynamics 365")
+            if not Config.DYNAMICS_TENANT_ID:
+                errors.append("Missing required DYNAMICS_TENANT_ID for Dynamics 365")
+        
+        if errors:
+            raise ValueError("Configuration errors:\n" + "\n".join(f"- {error}" for error in errors))
+        
+        logger = logging.getLogger(__name__)
+        logger.info("✅ Configuration validation passed")
+        logger.info(f"🏢 Company: {Config.COMPANY_NAME}")
+        logger.info(f"🗄️ Database: {db_config['host']}/{db_config['database']}")
+        logger.info(f"🤖 AI Model: {Config.DEPLOYMENT_NAME}")
+        logger.info(f"📧 Email: Entra ID configured ({Config.EMAIL_FROM})")
+        
+        if Config.ENABLE_DYNAMICS_SYNC:
+            logger.info(f"🔄 Dynamics 365: Enabled ({Config.DYNAMICS_URL})")
+            logger.info(f"   - Sync Quotes: {Config.DYNAMICS_SYNC_QUOTES}")
+            logger.info(f"   - Sync Users: {Config.DYNAMICS_SYNC_USERS}")
+            logger.info(f"   - Create Activities: {Config.DYNAMICS_CREATE_ACTIVITIES}")
+        else:
+            logger.info("🔄 Dynamics 365: Disabled")
+    
+    @staticmethod
+    def get_dynamics_config():
+        """Get Dynamics 365 specific configuration"""
+        return {
+            "url": Config.DYNAMICS_URL,
+            "tenant_id": Config.DYNAMICS_TENANT_ID,
+            "client_id": Config.DYNAMICS_CLIENT_ID,
+            "client_secret": Config.DYNAMICS_CLIENT_SECRET,
+            "sync_quotes": Config.DYNAMICS_SYNC_QUOTES,
+            "sync_users": Config.DYNAMICS_SYNC_USERS,
+            "create_activities": Config.DYNAMICS_CREATE_ACTIVITIES,
+            "entities": {
+                "quote": Config.DYNAMICS_QUOTE_ENTITY,
+                "contact": Config.DYNAMICS_CONTACT_ENTITY,
+                "account": Config.DYNAMICS_ACCOUNT_ENTITY,
+                "activity": Config.DYNAMICS_ACTIVITY_ENTITY
+            },
+            "sync_interval": Config.DYNAMICS_SYNC_INTERVAL,
+            "retry_interval": Config.DYNAMICS_RETRY_INTERVAL,
+            "max_retries": Config.DYNAMICS_MAX_RETRIES
+        }
