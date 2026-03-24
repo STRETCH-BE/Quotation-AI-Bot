@@ -117,7 +117,7 @@ class Config:
     # Entra ID Configuration for Email
     AZURE_TENANT_ID = os.getenv("AZURE_TENANT_ID", "53a74225-a02a-4073-958e-57c31880e64b")
     AZURE_CLIENT_ID = os.getenv("AZURE_CLIENT_ID", "623d7bd2-b256-4ecd-8234-d316afbc9357")
-    AZURE_CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET", "REMOVED")
+    AZURE_CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
     EMAIL_FROM = os.getenv("EMAIL_FROM", "assistant_quotes@stretchgroup.be")
     
     # Microsoft Graph API endpoint
