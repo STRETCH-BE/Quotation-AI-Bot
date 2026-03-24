@@ -19,3 +19,17 @@ pyvenv.cfg
 # IDE
 .vscode/
 .idea/
+
+# Python virtual environment lib folder
+lib/
+lib64
+bin/
+include/
+share/
+
+# Generated quote PDFs
+quotes/
+
+# Test files
+test_*.py
+send_campaign.py
