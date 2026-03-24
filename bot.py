@@ -1,6 +1,6 @@
 """
 Main Bot Class for Stretch Ceiling Bot
-Version 8.8 - Enhanced with Customer Selection, Complete User Management System, Fixed Quote Editing, and Dynamics 365 Integration
+Version 8.9 - Enhanced with Customer Selection, Complete User Management System, Fixed Quote Editing, Add/Remove Ceilings, and Dynamics 365 Integration
 """
 import os
 import logging
@@ -38,6 +38,7 @@ from handlers.customer_selection import CustomerSelectionHandler, CustomerState
 from utils import escape_markdown, format_price
 from handlers.dynamics365_integration import Dynamics365Service
 from models import ConversationState, is_customer_state
+from services.mail.email_listener import EmailListener
 
 # Setup logging
 setup_logging()
@@ -48,7 +49,7 @@ class EnhancedStretchCeilingBot:
     """Main bot class with all enhanced features including customer selection, user management and Dynamics 365"""
     
     def __init__(self):
-        self.version = "8.8"
+        self.version = "9.0"
         self.db = EnhancedDatabaseManager()
         # Use EnhancedAIChatManager directly
         self.ai_manager = EnhancedAIChatManager(self.db)
@@ -82,6 +83,10 @@ class EnhancedStretchCeilingBot:
         
         # Store bot start time
         self.start_time = datetime.now()
+        
+        # Email Quote Flow — background listener (started in startup_tasks)
+        self.email_listener: Optional[EmailListener] = None
+        self.email_listener_task = None
     
     async def startup_tasks(self):
         """Run startup tasks including user management setup and Dynamics 365"""
@@ -129,6 +134,22 @@ class EnhancedStretchCeilingBot:
                     logger.warning("⚠️ Dynamics 365 connection test failed")
             except Exception as e:
                 logger.error(f"❌ Error testing Dynamics connection: {e}")
+        
+        # Start Email Quote Flow listener
+        if Config.ENABLE_EMAIL_QUOTE_FLOW:
+            logger.info("📬 Starting Email Quote Flow listener...")
+            try:
+                self.email_listener = EmailListener(
+                    db_manager=self.db,
+                    pdf_gen=self.pdf_generator if Config.ENABLE_PDF_GENERATION else None,
+                )
+                self.email_listener_task = asyncio.create_task(
+                    self.email_listener.start()
+                )
+                self.email_listener.set_d365_service(self.dynamics_integration)
+                logger.info("✅ Email Quote Flow listener started")
+            except Exception as e:
+                logger.error(f"❌ Error starting Email Quote Flow listener: {e}")
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Enhanced start command with onboarding check"""
@@ -250,13 +271,77 @@ Ready to continue? Try /create_quote or /ask_a_question!"""
         session = self.db.get_quote_session(user_id)
         
         if session and update.message:  # Only show warning for regular command, not callback
+            keyboard = [[InlineKeyboardButton("🗑️ Sessie Wissen", callback_data="clear_quote_session")]]
             await update.message.reply_text(
-                "⚠️ You have an active quote creation session.\n"
-                "Your progress has been saved. You can continue it later or use /cancel to end it.\n\n"
-                "Showing your existing quotes..."
+                "⚠️ Je hebt een actieve offerte-sessie.\n"
+                "Je voortgang is opgeslagen. Je kunt later doorgaan of de sessie wissen.\n\n"
+                "Je bestaande offertes worden getoond...",
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
         
         await self.quote_editor.show_user_quotes(update, context)
+    
+    async def clear_quote_session(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Clear all quote-related sessions for user"""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = query.from_user.id
+        cleared_items = []
+        
+        # Clear database quote session using direct SQL
+        try:
+            if hasattr(self.db, 'clear_quote_session'):
+                self.db.clear_quote_session(user_id)
+            else:
+                # Direct SQL delete
+                with self.db.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("DELETE FROM quote_sessions WHERE user_id = %s", (user_id,))
+                    conn.commit()
+                    if cursor.rowcount > 0:
+                        cleared_items.append("database session")
+        except Exception as e:
+            logger.error(f"Error clearing DB session: {e}")
+        
+        # Clear customer selection session (in customer_selection handler)
+        try:
+            if hasattr(self, 'customer_selection') and hasattr(self.customer_selection, 'sessions'):
+                if user_id in self.customer_selection.sessions:
+                    del self.customer_selection.sessions[user_id]
+                    cleared_items.append("customer selection")
+        except Exception as e:
+            logger.error(f"Error clearing customer_selection: {e}")
+        
+        # Clear quote_flow sessions
+        try:
+            if hasattr(self, 'quote_flow'):
+                if hasattr(self.quote_flow, 'sessions') and user_id in self.quote_flow.sessions:
+                    del self.quote_flow.sessions[user_id]
+                    cleared_items.append("quote flow")
+                if hasattr(self.quote_flow, 'customer_selection') and hasattr(self.quote_flow.customer_selection, 'sessions'):
+                    if user_id in self.quote_flow.customer_selection.sessions:
+                        del self.quote_flow.customer_selection.sessions[user_id]
+                        cleared_items.append("quote flow customer selection")
+        except Exception as e:
+            logger.error(f"Error clearing quote_flow: {e}")
+        
+        # Clear context user_data
+        if context.user_data:
+            keys_to_clear = ['quote_session', 'customer_selection', 'current_quote', 'ceilings', 'customer', 
+                           'session_data', 'quote_state', 'current_ceiling', 'ceiling_index']
+            for key in keys_to_clear:
+                if key in context.user_data:
+                    context.user_data.pop(key, None)
+                    cleared_items.append(f"context:{key}")
+        
+        logger.info(f"Cleared quote session for user {user_id}: {cleared_items}")
+        
+        await query.edit_message_text(
+            "✅ **Sessie Gewist!**\n\n"
+            "Je offerte-sessie is volledig gewist.\n"
+            "Je kunt nu een nieuwe offerte starten met /quote."
+        )
     
     async def ask_question_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /ask_a_question command - works with both messages and callback queries"""
@@ -510,6 +595,11 @@ Select an option below:"""
 • Enter custom perimeter for complex room shapes
 • Useful for L-shaped rooms, alcoves, or curved designs
 
+✨ NEW: Add/Remove Ceilings
+• Edit existing quotes and add new ceilings
+• Remove unwanted ceilings from quotes
+• Full wizard for new ceiling properties
+
 🤖 AI Assistant:
 • /ask_a_question - Chat with AI assistant
 • Ask about products, pricing, installation
@@ -581,6 +671,7 @@ Features:
 ✅ Conversation memory
 ✅ Manual perimeter editing
 ✅ Quote editing and recalculation
+✅ Add/remove ceilings in quotes
 ✅ Admin user management
 ✅ Dynamics 365 CRM sync"""
         
@@ -655,7 +746,7 @@ Features:
         edit_sessions_count = len(self.quote_editor.edit_sessions) if hasattr(self.quote_editor, 'edit_sessions') else 0
         
         # Build status message without Markdown
-        status_msg = "🔧 System Status - v8.8 WITH CUSTOMER SELECTION, USER MANAGEMENT, FIXED QUOTE EDITING & DYNAMICS 365\n\n"
+        status_msg = "🔧 System Status - v9.1 WITH FULL ADD CEILING WIZARD, CUSTOMER SELECTION, USER MANAGEMENT & DYNAMICS 365\n\n"
         status_msg += f"Database: {db_connected}\n"
         status_msg += f"AI Assistant: {ai_display}\n"
         status_msg += f"Email Service: {email_status}\n"
@@ -721,6 +812,7 @@ Features:
         status_msg += f"• Perimeter Editing: ✅ Enabled\n"
         status_msg += f"• Customer Selection: ✅ Enabled\n"
         status_msg += f"• Quote Editing: ✅ Enhanced with conversation handler\n"
+        status_msg += f"• Add/Remove Ceilings: ✅ Enabled\n"
         status_msg += f"• User Management: ✅ Active\n"
         status_msg += f"• User Onboarding: ✅ Enabled\n"
         status_msg += f"• Dynamics 365 Sync: {'✅ Active' if Config.ENABLE_DYNAMICS_SYNC else '❌ Disabled'}\n\n"
@@ -1010,14 +1102,26 @@ Features:
                 await self.dynamics_sync_task
             except asyncio.CancelledError:
                 pass
+        
+        if self.email_listener_task and not self.email_listener_task.done():
+            logger.info("📬 Stopping Email Quote Flow listener...")
+            if self.email_listener:
+                self.email_listener.stop()
+            self.email_listener_task.cancel()
+            try:
+                await self.email_listener_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("📬 Email listener stopped")
+        
         logger.info("Shutdown complete")
     
     def run(self):
-        """Run the enhanced bot with customer selection, user management, fixed quote editing, and Dynamics 365"""
-        logger.info("🚀 Starting Enhanced Multi-Ceiling Bot v8.8 with CUSTOMER SELECTION, USER MANAGEMENT & DYNAMICS 365...")
-        logger.info("✨ COMPLETE USER PROFILES + CUSTOMER SELECTION + ONBOARDING + AI MEMORY + ADMIN MANAGEMENT + FIXED QUOTE EDITING + DYNAMICS 365!")
+        """Run the enhanced bot with customer selection, user management, fixed quote editing, add/remove ceilings, and Dynamics 365"""
+        logger.info("🚀 Starting Enhanced Multi-Ceiling Bot v9.1 with FULL ADD CEILING WIZARD, CUSTOMER SELECTION, USER MANAGEMENT & DYNAMICS 365...")
+        logger.info("✨ COMPLETE USER PROFILES + CUSTOMER SELECTION + ONBOARDING + AI MEMORY + ADMIN MANAGEMENT + QUOTE EDITING + ADD/REMOVE CEILINGS + DYNAMICS 365!")
         logger.info(
-            "📦 Features: Multi-ceiling quotes, Customer Selection, AI Chat, Quote Management, PDF Generation, ENTRA ID EMAIL, ADMIN MESSAGING, PERIMETER EDIT, USER MANAGEMENT, DYNAMICS 365"
+            "📦 Features: Multi-ceiling quotes, Customer Selection, AI Chat, Quote Management, PDF Generation, ENTRA ID EMAIL, ADMIN MESSAGING, PERIMETER EDIT, USER MANAGEMENT, ADD/REMOVE CEILINGS, DYNAMICS 365"
         )
         logger.info("🔑 Security: Token redaction enabled")
         logger.info("📧 Email Service: ENTRA ID (Microsoft Graph API) - Quotes sent via Microsoft")
@@ -1036,6 +1140,7 @@ Features:
         logger.info("✨ NEW: Complete user profiles with onboarding flow")
         logger.info("✨ NEW: AI remembers users and personalizes responses")
         logger.info("✨ NEW: Dynamics 365 CRM integration with bidirectional sync")
+        logger.info("✨ NEW: Add/remove ceilings in quote editing")
         logger.info("✨ FIXED: Quote editing with proper conversation handler")
         logger.info("✨ FIXED: Profile editing maintains state correctly")
         logger.info("✨ FIXED: Handle both messages and callback queries")
@@ -1152,7 +1257,8 @@ Features:
             
             application.add_handler(profile_edit_handler)
             
-            # Add quote editing conversation handler
+            # ==================== ENHANCED QUOTE EDITING WITH ADD/REMOVE CEILINGS ====================
+            # Add quote editing conversation handler with ALL states including add ceiling wizard
             quote_edit_handler = ConversationHandler(
                 entry_points=[
                     CallbackQueryHandler(
@@ -1161,12 +1267,14 @@ Features:
                     )
                 ],
                 states={
+                    # Main edit menu - handles all edit callbacks including add/remove ceiling
                     self.quote_editor.EDIT_MENU: [
                         CallbackQueryHandler(
-                            self.quote_editor.handle_quote_callback,
-                            pattern="^(edit_|quote_)"
+                            self.quote_editor.handle_edit_callback,
+                            pattern="^(edit_|add_ceiling|remove_ceiling|confirm_remove_ceiling_|cancel_remove_ceiling)"
                         )
                     ],
+                    # Basic editing states
                     self.quote_editor.EDIT_DIMENSIONS: [
                         MessageHandler(filters.TEXT & ~filters.COMMAND, 
                                      self.quote_editor.handle_edit_input)
@@ -1183,12 +1291,123 @@ Features:
                         MessageHandler(filters.TEXT & ~filters.COMMAND,
                                      self.quote_editor.handle_edit_input)
                     ],
+                    # ========== ADD CEILING WIZARD STATES (matching quote_flow.py) ==========
+                    self.quote_editor.ADD_CEILING_NAME: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                     self.quote_editor.handle_ceiling_name)
+                    ],
+                    self.quote_editor.ADD_CEILING_SIZE: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                     self.quote_editor.handle_ceiling_size)
+                    ],
+                    self.quote_editor.ADD_CEILING_SIZE_CONFIRM: [
+                        CallbackQueryHandler(
+                            self.quote_editor.handle_size_confirmation_callback,
+                            pattern="^add_ceiling_(size_ok|size_redo|edit_perimeter)$"
+                        )
+                    ],
+                    self.quote_editor.ADD_CEILING_PERIMETER_EDIT: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                     self.quote_editor.handle_perimeter_edit)
+                    ],
+                    self.quote_editor.ADD_CEILING_CORNERS: [
+                        CallbackQueryHandler(
+                            self.quote_editor.handle_corners_callback,
+                            pattern="^add_ceiling_corners_"
+                        )
+                    ],
+                    self.quote_editor.ADD_CEILING_TYPE: [
+                        CallbackQueryHandler(
+                            self.quote_editor.handle_type_callback,
+                            pattern="^add_ceiling_type_"
+                        )
+                    ],
+                    self.quote_editor.ADD_CEILING_TYPE_CEILING: [
+                        CallbackQueryHandler(
+                            self.quote_editor.handle_type_ceiling_callback,
+                            pattern="^add_ceiling_tc_"
+                        )
+                    ],
+                    self.quote_editor.ADD_CEILING_COLOR: [
+                        CallbackQueryHandler(
+                            self.quote_editor.handle_color_callback,
+                            pattern="^add_ceiling_color_"
+                        ),
+                        MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                     self.quote_editor.handle_color_text)
+                    ],
+                    self.quote_editor.ADD_CEILING_ACOUSTIC_PERF: [
+                        CallbackQueryHandler(
+                            self.quote_editor.handle_acoustic_perf_callback,
+                            pattern="^add_ceiling_acoustic_"
+                        )
+                    ],
+                    self.quote_editor.ADD_CEILING_PERIMETER_PROFILE: [
+                        CallbackQueryHandler(
+                            self.quote_editor.handle_perimeter_profile_callback,
+                            pattern="^add_ceiling_profile_"
+                        )
+                    ],
+                    self.quote_editor.ADD_CEILING_SEAM_QUESTION: [
+                        CallbackQueryHandler(
+                            self.quote_editor.handle_seam_question_callback,
+                            pattern="^add_ceiling_seams_"
+                        )
+                    ],
+                    self.quote_editor.ADD_CEILING_SEAM_LENGTH: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                     self.quote_editor.handle_seam_length)
+                    ],
+                    self.quote_editor.ADD_CEILING_LIGHTS_QUESTION: [
+                        CallbackQueryHandler(
+                            self.quote_editor.handle_lights_question_callback,
+                            pattern="^add_ceiling_lights_"
+                        )
+                    ],
+                    self.quote_editor.ADD_CEILING_LIGHT_SELECTION: [
+                        CallbackQueryHandler(
+                            self.quote_editor.handle_light_selection_callback,
+                            pattern="^add_ceiling_light_"
+                        )
+                    ],
+                    self.quote_editor.ADD_CEILING_LIGHT_QUANTITY: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                     self.quote_editor.handle_light_quantity)
+                    ],
+                    self.quote_editor.ADD_CEILING_MORE_LIGHTS: [
+                        CallbackQueryHandler(
+                            self.quote_editor.handle_more_lights_callback,
+                            pattern="^add_ceiling_more_lights_"
+                        )
+                    ],
+                    self.quote_editor.ADD_CEILING_WOOD_QUESTION: [
+                        CallbackQueryHandler(
+                            self.quote_editor.handle_wood_question_callback,
+                            pattern="^add_ceiling_wood_"
+                        )
+                    ],
+                    self.quote_editor.ADD_CEILING_WOOD_SELECTION: [
+                        CallbackQueryHandler(
+                            self.quote_editor.handle_wood_selection_callback,
+                            pattern="^add_ceiling_wood_"
+                        )
+                    ],
+                    self.quote_editor.ADD_CEILING_WOOD_QUANTITY: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                     self.quote_editor.handle_wood_quantity)
+                    ],
+                    self.quote_editor.ADD_CEILING_MORE_WOOD: [
+                        CallbackQueryHandler(
+                            self.quote_editor.handle_more_wood_callback,
+                            pattern="^add_ceiling_more_wood_"
+                        )
+                    ],
                 },
                 fallbacks=[
                     CommandHandler("cancel", self.quote_editor.handle_cancel_edit),
                     CallbackQueryHandler(
                         self.quote_editor.cancel_edit,
-                        pattern="^edit_cancel_\\d+$"
+                        pattern="^edit_cancel$"
                     )
                 ],
                 name="quote_editing",
@@ -1196,7 +1415,26 @@ Features:
                 per_message=False
             )
             
+            # Add the quote_edit_handler to the application
             application.add_handler(quote_edit_handler)
+            
+            # Add quote callbacks handler (view, status, pdf, email, delete)
+            application.add_handler(CallbackQueryHandler(
+                self.quote_editor.handle_quote_callback,
+                pattern="^(quote_view_|quote_status_|status_change_|quote_pdf_|quote_email_|quote_delete_|confirm_delete_|quote_list|quote_list_back)"
+            ))
+            
+            # Add quote action handlers (PDF generation, email sending after save)
+            application.add_handler(CallbackQueryHandler(
+                self.quote_editor.handle_quote_action,
+                pattern="^(quote_action_pdf_|quote_action_email_|back_to_main)"
+            ))
+            
+            # Add clear session handler
+            application.add_handler(CallbackQueryHandler(
+                self.clear_quote_session,
+                pattern="^clear_quote_session$"
+            ))
             
             # Add admin messaging conversation handler
             admin_conv_handler = ConversationHandler(
@@ -1273,7 +1511,7 @@ Features:
             # Quote editor callbacks (excluding those handled by conversation handler)
             application.add_handler(CallbackQueryHandler(
                 self.quote_editor.handle_quote_callback,
-                pattern="^(quote_view_|quote_status_|status_change_|quote_pdf_|quote_email_|quote_list|quote_list_back)"
+                pattern="^(quote_view_|quote_status_|status_change_|quote_pdf_|quote_email_|quote_delete_|confirm_delete_|quote_list|quote_list_back)"
             ))
             
             # Inline command callbacks
@@ -1286,7 +1524,7 @@ Features:
             application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
             
             # Start bot
-            logger.info("✅ Bot is running with CUSTOMER SELECTION, COMPLETE USER MANAGEMENT SYSTEM & DYNAMICS 365...")
+            logger.info("✅ Bot is running with CUSTOMER SELECTION, COMPLETE USER MANAGEMENT SYSTEM, ADD/REMOVE CEILINGS & DYNAMICS 365...")
             logger.info("👥 New users will go through onboarding automatically")
             logger.info("👤 Customer selection available before quote creation")
             logger.info("📝 User profiles stored with full information")
@@ -1295,6 +1533,8 @@ Features:
             logger.info("📊 Dynamics 365 CRM integration active")
             logger.info("📏 PERIMETER: Manual editing enabled for complex room shapes")
             logger.info("✏️ QUOTE EDITOR: Now using proper conversation handler")
+            logger.info("➕ ADD CEILING: Full wizard to add new ceilings to quotes")
+            logger.info("🗑️ REMOVE CEILING: Remove unwanted ceilings from quotes")
             logger.info("✅ PRIORITY: Admin commands now work in AI chat mode")
             logger.info("✅ QUOTE EDITING: Fixed with proper state management")
             logger.info("✅ CALLBACK QUERIES: Now properly handled for all commands")

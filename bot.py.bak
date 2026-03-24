@@ -1,0 +1,1204 @@
+# -*- coding: utf-8 -*-
+"""
+Main Bot Class for Stretch Ceiling Bot
+Version 8.7 - Enhanced with Complete User Management System, Fixed Quote Editing, and Dynamics 365 Integration
+"""
+import os
+import logging
+import traceback
+import asyncio
+from datetime import datetime
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    CallbackQueryHandler,
+    ConversationHandler,
+)
+
+from config import Config, setup_logging
+from database import EnhancedDatabaseManager, add_admin_messaging_tables
+from services import (
+    EnhancedAIChatManager,
+    EntraIDEmailSender,
+    ImprovedStretchQuotePDFGenerator,
+    CostCalculator
+)
+from handlers import (
+    EnhancedMultiCeilingQuoteFlow,
+    QuoteEditor,
+    ConversationalBotHandler,
+    AdminMessagingSystem,
+    UserOnboardingHandler,
+    AdminUserManagement
+)
+from utils import escape_markdown, format_price
+from handlers.dynamics365_integration import Dynamics365IntegrationHandler
+
+# Setup logging
+setup_logging()
+logger = logging.getLogger(__name__)
+
+class EnhancedStretchCeilingBot:
+    """Main bot class with all enhanced features including user management and Dynamics 365"""
+    
+    def __init__(self):
+        self.version = "8.7"
+        self.db = EnhancedDatabaseManager()
+        # Use EnhancedAIChatManager directly
+        self.ai_manager = EnhancedAIChatManager(self.db)
+        self.quote_flow = EnhancedMultiCeilingQuoteFlow(self.db)
+        self.quote_editor = QuoteEditor(self.db, self.quote_flow.calculator)
+        self.conversational_handler = ConversationalBotHandler(self.db, self.ai_manager)
+        self.admin_messaging = AdminMessagingSystem(self.db)
+        
+        # Add new handlers for user management
+        self.user_onboarding = UserOnboardingHandler(self.db)
+        self.admin_user_mgmt = AdminUserManagement(self.db)
+        
+        # Initialize Dynamics 365 integration
+        self.dynamics_integration = Dynamics365IntegrationHandler(self.db)
+        
+        # Store reference for bidirectional sync task
+        self.dynamics_sync_task = None
+        
+        # Set up email sender
+        self.email_sender = EntraIDEmailSender()
+        
+        # Set up PDF generator if enabled
+        if Config.ENABLE_PDF_GENERATION:
+            self.pdf_generator = ImprovedStretchQuotePDFGenerator()
+            # Pass the PDF generator to quote_editor
+            self.quote_editor.pdf_generator = self.pdf_generator
+        
+        # Pass email sender to quote_editor
+        if Config.ENABLE_EMAIL_SENDING:
+            self.quote_editor.email_sender = self.email_sender
+        
+        # Store bot start time
+        self.start_time = datetime.now()
+    
+    async def startup_tasks(self):
+        """Run startup tasks including user management setup and Dynamics 365"""
+        # Enhanced user tables are already created in EnhancedDatabaseManager.__init__()
+        logger.info("📊 Enhanced user management tables already set up by database manager")
+        
+        # Scrape website data for AI context
+        if Config.ENABLE_AI_CHAT:
+            await self.ai_manager.scrape_website_data()
+        
+        # Test Entra ID email connection
+        if Config.ENABLE_EMAIL_SENDING:
+            logger.info("🔧 Testing Entra ID email connection...")
+            try:
+                # Use the async version since we're in an async context
+                if await self.email_sender.test_connection_async():
+                    logger.info("✅ Entra ID email connection successful")
+                else:
+                    logger.warning("âš ï¸ Entra ID email connection test failed")
+            except Exception as e:
+                logger.error(f"âŒ Error testing email connection: {e}")
+                logger.warning("âš ï¸ Email service may not be available")
+        
+        # Test Dynamics 365 connection
+        if Config.ENABLE_DYNAMICS_SYNC:
+            logger.info("📊 Testing Dynamics 365 connection...")
+            try:
+                if await self.dynamics_integration.test_connection():
+                    logger.info("✅ Dynamics 365 connection successful")
+                    
+                    # Start background sync task for bidirectional sync
+                    self.dynamics_sync_task = asyncio.create_task(
+                        self.dynamics_integration.periodic_sync_task()
+                    )
+                    logger.info("ðŸ”„ Started Dynamics 365 bidirectional sync task")
+                    
+                    # Sync any pending items
+                    asyncio.create_task(self.dynamics_integration.sync_pending_entities())
+                else:
+                    logger.warning("âš ï¸ Dynamics 365 connection test failed")
+            except Exception as e:
+                logger.error(f"âŒ Error testing Dynamics connection: {e}")
+    
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Enhanced start command with onboarding check"""
+        user = update.effective_user
+        logger.info(f"ðŸ‘¤ User {user.id} ({user.first_name}) started the bot")
+        
+        # Check if user has completed onboarding
+        user_profile = self.db.get_user_profile(user.id)
+        
+        if not user_profile or not user_profile.get('onboarding_completed'):
+            # Start onboarding for new users - this returns the state
+            return await self.user_onboarding.start_onboarding(update, context)
+        
+        # For existing users, show personalized welcome
+        is_admin = user.id in Config.ADMIN_USER_IDS
+        admin_text = " (Admin Mode)" if is_admin else ""
+        
+        # Get user's name from profile
+        user_name = user_profile.get('first_name', user.first_name)
+        company_info = ""
+        if user_profile.get('is_company'):
+            company_info = f"\nðŸ¢ Company: {user_profile['company_name']}"
+        
+        # Get AI status for display
+        ai_status = "ðŸ¤– AI Assistant: Available" if self.ai_manager.client else "ðŸ¤– AI Assistant: Fallback Mode"
+        
+        # Get Dynamics sync status
+        dynamics_info = ""
+        if Config.ENABLE_DYNAMICS_SYNC:
+            dynamics_ids = self.db.get_user_dynamics_ids(user.id)
+            if dynamics_ids.get('contact_id'):
+                dynamics_info = "\n📊 Dynamics 365: ✅ Synced"
+            else:
+                dynamics_info = "\n📊 Dynamics 365: â³ Pending sync"
+        
+        welcome_message = f"""ðŸ  Welcome back to {Config.COMPANY_NAME}, {user_name}!{admin_text}{company_info}
+
+I remember you! Here's what you can do:
+
+📋 Quote Creation
+â€¢ /create_quote - Start a new multi-ceiling quote
+â€¢ /quotes - View and manage your quotes
+
+ðŸ¤– AI Assistant
+â€¢ /ask_a_question - Chat with our AI assistant
+â€¢ I remember our past conversations!
+{ai_status}
+
+ðŸ‘¤ Profile Management
+â€¢ /profile - View and edit your profile
+â€¢ Your client type: {user_profile.get('client_group', 'price_b2c').replace('price_', '').upper()}
+
+🔧 Email & PDFs
+â€¢ Quotes automatically include your information
+â€¢ Professional PDFs with your details
+â€¢ Email delivery via Microsoft
+{dynamics_info}
+
+ðŸ”§ Other Commands
+â€¢ /help - Detailed help and support
+â€¢ /status - Check system status"""
+        
+        if is_admin:
+            welcome_message += """
+
+ðŸ‘” Admin Commands
+â€¢ /admin - Admin control panel
+â€¢ /send_message - Send messages to users
+â€¢ Manage users and view statistics
+â€¢ Dynamics 365 sync management"""
+        
+        welcome_message += """
+
+Ready to continue? Try /create_quote or /ask_a_question!"""
+        
+        await update.message.reply_text(welcome_message)
+        
+        # Log the interaction
+        self.ai_manager.log_conversation(user.id, "user", "/start")
+        self.ai_manager.log_conversation(user.id, "bot", welcome_message)
+        
+        # Important: Return ConversationHandler.END to indicate we're not in onboarding
+        return ConversationHandler.END
+    
+    async def profile_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show user profile - works with both messages and callback queries"""
+        await self.user_onboarding.show_user_profile(update, context)
+    
+    async def create_quote_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /create_quote command with onboarding check - works with both messages and callback queries"""
+        user_profile = self.db.get_user_profile(update.effective_user.id)
+        
+        # Determine how to send the response
+        if update.callback_query:
+            message_func = update.callback_query.message.reply_text
+        else:
+            message_func = update.message.reply_text
+        
+        if not user_profile or not user_profile.get('onboarding_completed'):
+            await message_func(
+                "Please complete your profile first before creating a quote.\n"
+                "Use /start to begin the registration process."
+            )
+            return
+        
+        # For callback queries, we need to handle this differently
+        if update.callback_query:
+            # Create a new message to start the quote flow
+            await message_func("Starting quote creation...")
+            # The quote flow expects a message, so we'll need to handle this specially
+            update._effective_message = update.callback_query.message
+        
+        await self.quote_flow.start_quote_flow(update, context)
+    
+    async def quotes_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /quotes command - works with both messages and callback queries"""
+        # Check if user has an active quote session and warn them
+        user_id = update.effective_user.id
+        session = self.db.get_quote_session(user_id)
+        
+        if session and update.message:  # Only show warning for regular command, not callback
+            await update.message.reply_text(
+                "âš ï¸ You have an active quote creation session.\n"
+                "Your progress has been saved. You can continue it later or use /cancel to end it.\n\n"
+                "Showing your existing quotes..."
+            )
+        
+        await self.quote_editor.show_user_quotes(update, context)
+    
+    async def ask_question_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /ask_a_question command - works with both messages and callback queries"""
+        if Config.ENABLE_AI_CHAT:
+            await self.conversational_handler.handle_ai_question(update, context)
+        else:
+            # Handle both Update and CallbackQuery objects
+            if update.callback_query:
+                await update.callback_query.message.reply_text(
+                    "AI chat is currently disabled. Please contact support for assistance."
+                )
+            elif update.message:
+                await update.message.reply_text(
+                    "AI chat is currently disabled. Please contact support for assistance."
+                )
+    
+    async def admin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /admin command - show admin menu"""
+        user_id = update.effective_user.id
+        
+        if user_id not in Config.ADMIN_USER_IDS:
+            await update.message.reply_text("⛔ This command is for administrators only.")
+            return
+        
+        keyboard = [
+            ["📨 Send Messages"],
+            ["📊 View Statistics"],
+            ["👥 User Management"],
+            ["📊 Dynamics 365 Sync"],
+            ["🔧 System Diagnostics"],
+            ["❌ Exit Admin Mode"],
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+        
+        admin_menu = """👑 Admin Control Panel
+
+Welcome to the admin interface. What would you like to do?
+
+Available Options:
+• 📨 Send Messages - Message users individually or broadcast
+• 📊 View Statistics - See usage and performance stats
+• 👥 User Management - Manage user permissions and data
+• 📊 Dynamics 365 Sync - Manage CRM synchronization
+• 🔧 System Diagnostics - Check system health
+
+Select an option below:"""
+        
+        await update.message.reply_text(admin_menu, reply_markup=reply_markup)
+    
+    async def handle_admin_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle admin menu selections with user management and Dynamics"""
+        user_id = update.effective_user.id
+        
+        if user_id not in Config.ADMIN_USER_IDS:
+            return
+        
+        message_text = update.message.text
+        
+        if message_text == "📨 Send Messages":
+            return await self.admin_messaging.admin_message_command(update, context)
+        
+        elif message_text == "📊 View Statistics":
+            await self.show_admin_statistics(update, context)
+        
+        elif message_text == "👥 User Management":
+            await self.admin_user_mgmt.handle_user_management(update, context)
+        
+        elif message_text == "📊 Dynamics 365 Sync":
+            await self.show_dynamics_sync_menu(update, context)
+        
+        elif message_text == "🔧 System Diagnostics":
+            await self.status_command(update, context)
+        
+        elif message_text == "❌ Exit Admin Mode":
+            await update.message.reply_text("Exited admin mode.", reply_markup=ReplyKeyboardRemove())
+        
+        # User management sub-menus
+        elif message_text in ["📋 List All Users", "🔍 Search Users"]:
+            if message_text == "📋 List All Users":
+                await self.admin_user_mgmt.handle_user_list(update, context)
+            else:
+                await self.admin_user_mgmt.handle_user_search(update, context)
+        
+        elif message_text == "📊 User Statistics":
+            await self.admin_user_mgmt.handle_user_statistics(update, context)
+        
+        elif message_text == "⬅️ Back to Admin Menu":
+            await self.admin_command(update, context)
+        
+        # Search criteria handling
+        elif message_text in ["Search by Name", "Search by Email", "Search by Company", 
+                             "Search by Phone", "Show Companies Only", "Show B2B Users", 
+                             "Show Active Users", "Show With Quotes"]:
+            await self.admin_user_mgmt.handle_search_criteria(update, context)
+    
+    async def show_dynamics_sync_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show Dynamics 365 sync management menu"""
+        if not Config.ENABLE_DYNAMICS_SYNC:
+            await update.message.reply_text("Dynamics 365 integration is not enabled.")
+            return
+        
+        # Get sync statistics
+        stats = self.dynamics_integration.get_sync_statistics()
+        
+        message = "📊 **Dynamics 365 Sync Management**\n\n"
+        message += f"**Sync Status:**\n"
+        message += f"â€¢ Users Synced: {stats.get('synced_users', 0)}\n"
+        message += f"â€¢ Users Pending: {stats.get('pending_users', 0)}\n"
+        message += f"â€¢ Users with Errors: {stats.get('error_users', 0)}\n\n"
+        message += f"â€¢ Quotes Synced: {stats.get('synced_quotes', 0)}\n"
+        message += f"â€¢ Quotes Pending: {stats.get('pending_quotes', 0)}\n"
+        message += f"â€¢ Quotes with Errors: {stats.get('error_quotes', 0)}\n\n"
+        message += f"**Recent Activity (24h):**\n"
+        message += f"â€¢ Total Syncs: {stats.get('syncs_24h', 0)}\n"
+        message += f"â€¢ Errors: {stats.get('errors_24h', 0)}\n"
+        
+        # Check background sync status
+        if self.dynamics_sync_task and not self.dynamics_sync_task.done():
+            message += f"\n✅ Bidirectional sync is active"
+        else:
+            message += f"\nâš ï¸ Bidirectional sync is not running"
+        
+        keyboard = [
+            ["ðŸ”„ Sync Pending Items"],
+            ["🔍 View Sync Errors"],
+            ["ðŸ‘¤ Sync Specific User"],
+            ["ðŸ“„ Sync Specific Quote"],
+            ["ðŸ”„ Force Full Sync"],
+            ["â¬…ï¸ Back to Admin Menu"]
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+        
+        await update.message.reply_text(
+            message,
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
+        
+        # Store state for handling responses
+        context.user_data['admin_dynamics_menu'] = True
+    
+    async def handle_dynamics_menu_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle Dynamics 365 menu selections"""
+        if not context.user_data.get('admin_dynamics_menu'):
+            return
+        
+        message_text = update.message.text
+        
+        if message_text == "ðŸ”„ Sync Pending Items":
+            await update.message.reply_text("ðŸ”„ Starting sync of pending items...")
+            await self.dynamics_integration.sync_pending_entities()
+            await update.message.reply_text("✅ Sync completed!")
+            context.user_data['admin_dynamics_menu'] = False
+            
+        elif message_text == "🔍 View Sync Errors":
+            errors = self.dynamics_integration.get_sync_errors(limit=10)
+            if errors:
+                error_msg = "âŒ **Recent Sync Errors:**\n\n"
+                for error in errors[:5]:  # Show first 5
+                    error_msg += f"â€¢ {error['entity_type']} {error['entity_id']}: {error['error_message'][:50]}...\n"
+                await update.message.reply_text(error_msg, parse_mode="Markdown")
+            else:
+                await update.message.reply_text("✅ No recent sync errors!")
+            context.user_data['admin_dynamics_menu'] = False
+            
+        elif message_text == "ðŸ‘¤ Sync Specific User":
+            await update.message.reply_text("Enter the Telegram User ID to sync:")
+            context.user_data['admin_dynamics_menu'] = False
+            context.user_data['awaiting_dynamics_user_id'] = True
+            
+        elif message_text == "ðŸ“„ Sync Specific Quote":
+            await update.message.reply_text("Enter the Quote ID to sync:")
+            context.user_data['admin_dynamics_menu'] = False
+            context.user_data['awaiting_dynamics_quote_id'] = True
+            
+        elif message_text == "ðŸ”„ Force Full Sync":
+            await update.message.reply_text("ðŸ”„ Starting full bidirectional sync...")
+            await self.dynamics_integration.sync_from_dynamics()
+            await update.message.reply_text("✅ Full sync completed!")
+            context.user_data['admin_dynamics_menu'] = False
+            
+        elif message_text == "â¬…ï¸ Back to Admin Menu":
+            context.user_data['admin_dynamics_menu'] = False
+            await self.admin_command(update, context)
+    
+    async def show_admin_statistics(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show admin statistics"""
+        # Get various statistics
+        stats = self.db.execute_query(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM users) as total_users,
+                (SELECT COUNT(*) FROM users WHERE last_activity > DATE_SUB(NOW(), INTERVAL 7 DAY)) as active_users_week,
+                (SELECT COUNT(*) FROM users WHERE last_activity > DATE_SUB(NOW(), INTERVAL 30 DAY)) as active_users_month,
+                (SELECT COUNT(*) FROM quotations) as total_quotes,
+                (SELECT COUNT(*) FROM quotations WHERE created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)) as quotes_week,
+                (SELECT COUNT(*) FROM quotations WHERE status = 'accepted') as accepted_quotes,
+                (SELECT COUNT(*) FROM conversation_logs WHERE created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)) as messages_24h,
+                (SELECT SUM(total_price) FROM quotations WHERE status = 'accepted') as total_revenue
+            """,
+            fetch=True,
+        )
+        
+        if stats and stats[0]:
+            s = stats[0]
+            report = f"""📊 Admin Statistics Dashboard
+
+ðŸ‘¥ Users:
+â€¢ Total Users: {s['total_users']}
+â€¢ Active (7 days): {s['active_users_week']}
+â€¢ Active (30 days): {s['active_users_month']}
+
+📋 Quotes:
+â€¢ Total Quotes: {s['total_quotes']}
+â€¢ This Week: {s['quotes_week']}
+â€¢ Accepted: {s['accepted_quotes']}
+â€¢ Success Rate: {(s['accepted_quotes'] / s['total_quotes'] * 100) if s['total_quotes'] > 0 else 0:.1f}%
+
+ðŸ’¬ Activity:
+â€¢ Messages (24h): {s['messages_24h']}
+â€¢ Avg Daily Users: {s['active_users_week'] / 7:.1f}
+
+ðŸ’° Revenue:
+â€¢ Total Accepted: â‚¬{s['total_revenue'] or 0:,.2f}
+â€¢ Average Quote: â‚¬{(s['total_revenue'] / s['accepted_quotes']) if s['accepted_quotes'] > 0 else 0:,.2f}"""
+            
+            await update.message.reply_text(report)
+    
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Enhanced help command with admin info"""
+        # Handle both Update and CallbackQuery objects
+        if hasattr(update, 'effective_user'):
+            user_id = update.effective_user.id
+            message = update.message
+        elif hasattr(update, 'callback_query'):
+            user_id = update.callback_query.from_user.id
+            message = update.callback_query.message
+        else:
+            # This shouldn't happen, but just in case
+            logger.error("Could not determine user_id in help_command")
+            return
+        
+        is_admin = user_id in Config.ADMIN_USER_IDS
+        
+        help_text = f"""â“ {Config.COMPANY_NAME} Bot Help
+
+📋 Quote Commands:
+â€¢ /create_quote - Start a new quote
+â€¢ /quotes - View all your quotes
+â€¢ Type 'back' to go to previous step
+â€¢ Type 'cancel' to stop quote creation
+
+ðŸ‘¤ Profile Management:
+â€¢ /profile - View and edit your profile
+â€¢ Complete profile for personalized quotes
+â€¢ Edit your information anytime
+
+âœ¨ NEW: Perimeter Editing
+â€¢ After entering dimensions, choose "âœï¸ Edit perimeter"
+â€¢ Enter custom perimeter for complex room shapes
+â€¢ Useful for L-shaped rooms, alcoves, or curved designs
+
+ðŸ¤– AI Assistant:
+â€¢ /ask_a_question - Chat with AI assistant
+â€¢ Ask about products, pricing, installation
+â€¢ Type 'exit' to leave AI chat mode
+
+📊 Quote Management Features:
+â€¢ View quotes with status indicators
+â€¢ Change quote status
+â€¢ Generate PDF quotes
+â€¢ Email delivery via Microsoft
+â€¢ Edit quotes with real-time updates
+â€¢ Add/remove ceilings
+â€¢ Update dimensions, colors, and more
+
+ðŸ”„ Navigation Tips:
+â€¢ Use 'â¬…ï¸ Back' button to go back
+â€¢ Your progress is saved automatically
+â€¢ Resume interrupted quotes anytime
+
+âœï¸ Quote Editing:
+â€¢ Click "Edit Quote" to modify any quote
+â€¢ Change dimensions, perimeter, colors
+â€¢ Add or remove ceilings
+â€¢ Recalculate prices instantly
+â€¢ All changes tracked properly
+
+📊 Dynamics 365 Integration:
+â€¢ User profiles sync to CRM
+â€¢ Quotes automatically sync
+â€¢ Bidirectional updates
+â€¢ Real-time synchronization"""
+        
+        if is_admin:
+            help_text += """
+
+ðŸ‘” Admin Commands:
+â€¢ /admin - Open admin control panel
+â€¢ /send_message - Send messages to users
+â€¢ Broadcast to all users
+â€¢ Message individual users
+â€¢ View messaging history
+â€¢ Access user statistics
+â€¢ Manage user permissions
+â€¢ Search and filter users
+â€¢ Add notes to user profiles
+â€¢ Export user data
+â€¢ Manage Dynamics 365 sync
+â€¢ Monitor sync status
+â€¢ Handle sync errors"""
+        
+        help_text += f"""
+
+ðŸ“ž Support:
+🔧 {Config.COMPANY_EMAIL}
+ðŸ“ž {Config.COMPANY_PHONE}
+ðŸŒ {Config.COMPANY_WEBSITE}
+ðŸ“ {Config.COMPANY_ADDRESS}
+
+Features:
+✅ User profiles and onboarding
+✅ Multi-ceiling quotes
+✅ AI-powered assistance with memory
+✅ Professional PDFs
+✅ Email delivery (Entra ID)
+✅ Quote history tracking
+✅ Smart product recommendations
+✅ Conversation memory
+✅ Manual perimeter editing
+✅ Quote editing and recalculation
+✅ Admin user management
+✅ Dynamics 365 CRM sync"""
+        
+        # Send the help message
+        if message:
+            await message.reply_text(help_text)
+        elif hasattr(update, 'callback_query'):
+            await update.callback_query.message.reply_text(help_text)
+    
+    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /status command - ENHANCED WITH ENTRA ID AND DYNAMICS STATUS"""
+        db_connected = "✅ Connected" if self.db.test_connection() else "âŒ Disconnected"
+        
+        # Get AI status
+        ai_status = self.ai_manager.get_status()
+        ai_display = "✅ Active" if ai_status["client_initialized"] else "âš ï¸ Fallback Mode"
+        
+        # Test Entra ID email - FIX: Properly handle the synchronous method
+        email_status = "âŒ Disabled"
+        if Config.ENABLE_EMAIL_SENDING:
+            try:
+                # Since test_connection is synchronous in EntraIDEmailSender, we can call it directly
+                email_test = self.email_sender.test_connection()
+                email_status = "✅ Connected (Entra ID)" if email_test else "âš ï¸ Connection Failed"
+            except Exception as e:
+                logger.error(f"Error testing email connection: {e}")
+                email_status = "âš ï¸ Error testing connection"
+        
+        # Dynamics 365 status
+        dynamics_status = "âŒ Disabled"
+        dynamics_sync_active = "No"
+        if Config.ENABLE_DYNAMICS_SYNC:
+            try:
+                dynamics_test = await self.dynamics_integration.test_connection()
+                dynamics_status = "✅ Connected" if dynamics_test else "âš ï¸ Connection Failed"
+                
+                # Check if background sync is running
+                if self.dynamics_sync_task and not self.dynamics_sync_task.done():
+                    dynamics_sync_active = "Yes (Bidirectional)"
+            except Exception as e:
+                logger.error(f"Error testing Dynamics connection: {e}")
+                dynamics_status = "âš ï¸ Error testing connection"
+        
+        # Get some statistics
+        ceiling_count = self.db.execute_query(
+            "SELECT COUNT(*) as count FROM products WHERE base_category = 'ceiling'", fetch=True
+        )
+        
+        # Get type_ceiling variations
+        type_variations = self.db.execute_query(
+            """
+            SELECT product_type, COUNT(DISTINCT type_ceiling) as variations
+            FROM products
+            WHERE base_category = 'ceiling'
+            AND type_ceiling IS NOT NULL
+            GROUP BY product_type
+            """,
+            fetch=True,
+        )
+        
+        # Get user statistics
+        user_stats = self.db.execute_query(
+            """
+            SELECT
+                COUNT(DISTINCT user_id) as total_users,
+                COUNT(DISTINCT CASE WHEN created_at > DATE_SUB(NOW(), INTERVAL 7 DAY) THEN user_id END) as active_users
+            FROM conversation_logs
+            """,
+            fetch=True,
+        )
+        
+        # Check for active edit sessions
+        edit_sessions_count = len(self.quote_editor.edit_sessions) if hasattr(self.quote_editor, 'edit_sessions') else 0
+        
+        # Build status message without Markdown
+        status_msg = "ðŸ”§ System Status - v8.7 WITH USER MANAGEMENT, FIXED QUOTE EDITING & DYNAMICS 365\n\n"
+        status_msg += f"Database: {db_connected}\n"
+        status_msg += f"AI Assistant: {ai_display}\n"
+        status_msg += f"Email Service: {email_status}\n"
+        status_msg += f"Dynamics 365: {dynamics_status}\n"
+        status_msg += f"Background Sync: {dynamics_sync_active}\n"
+        status_msg += f"Ceiling Products: {ceiling_count[0]['count'] if ceiling_count else 'N/A'}\n"
+        status_msg += f"Active Edit Sessions: {edit_sessions_count}\n"
+        
+        # AI Configuration Details
+        status_msg += f"\nAI Configuration:\n"
+        status_msg += f"â€¢ API Key: {'✅' if ai_status.get('api_key_configured') else 'âŒ'}\n"
+        status_msg += f"â€¢ Endpoint: {'✅' if ai_status.get('endpoint_configured') else 'âŒ'}\n"
+        status_msg += f"â€¢ Deployment: {ai_status.get('deployment_name', 'N/A')}\n"
+        status_msg += f"â€¢ API Version: {ai_status.get('api_version', 'N/A')}\n"
+        
+        # Email Configuration Details
+        status_msg += f"\nEmail Configuration (Entra ID):\n"
+        status_msg += f"â€¢ Tenant ID: {'✅ Configured' if Config.AZURE_TENANT_ID else 'âŒ Missing'}\n"
+        status_msg += f"â€¢ Client ID: {'✅ Configured' if Config.AZURE_CLIENT_ID else 'âŒ Missing'}\n"
+        status_msg += f"â€¢ Client Secret: {'✅ Configured' if Config.AZURE_CLIENT_SECRET else 'âŒ Missing'}\n"
+        status_msg += f"â€¢ From Email: {Config.EMAIL_FROM}\n"
+        status_msg += f"â€¢ Graph API: Microsoft Graph v1.0\n"
+        
+        # Dynamics 365 Configuration Details
+        status_msg += f"\nDynamics 365 Configuration:\n"
+        status_msg += f"â€¢ Instance URL: {'✅ Configured' if Config.DYNAMICS_URL else 'âŒ Missing'}\n"
+        status_msg += f"â€¢ App Registration: {'✅ Configured' if Config.DYNAMICS_CLIENT_ID else 'âŒ Missing'}\n"
+        status_msg += f"â€¢ User Sync: {'✅ Enabled' if Config.DYNAMICS_SYNC_USERS else 'âŒ Disabled'}\n"
+        status_msg += f"â€¢ Quote Sync: {'✅ Enabled' if Config.DYNAMICS_SYNC_QUOTES else 'âŒ Disabled'}\n"
+        status_msg += f"â€¢ Bidirectional Sync: {'✅ Active' if dynamics_sync_active == 'Yes (Bidirectional)' else 'âŒ Inactive'}\n"
+        
+        # Get sync statistics
+        if Config.ENABLE_DYNAMICS_SYNC:
+            sync_stats = self.dynamics_integration.get_sync_statistics()
+            if sync_stats:
+                status_msg += f"\nDynamics Sync Statistics:\n"
+                status_msg += f"â€¢ Synced Users: {sync_stats.get('synced_users', 0)}\n"
+                status_msg += f"â€¢ Pending Users: {sync_stats.get('pending_users', 0)}\n"
+                status_msg += f"â€¢ Synced Quotes: {sync_stats.get('synced_quotes', 0)}\n"
+                status_msg += f"â€¢ Pending Quotes: {sync_stats.get('pending_quotes', 0)}\n"
+                status_msg += f"â€¢ Syncs (24h): {sync_stats.get('syncs_24h', 0)}\n"
+                if sync_stats.get('errors_24h', 0) > 0:
+                    status_msg += f"â€¢ Errors (24h): {sync_stats.get('errors_24h', 0)} âš ï¸\n"
+        
+        if type_variations:
+            status_msg += f"\nType Ceiling Variations:\n"
+            for tv in type_variations:
+                status_msg += f"â€¢ {tv['product_type']}: {tv['variations']} types\n"
+        
+        if user_stats and user_stats[0]:
+            status_msg += f"\nUser Statistics:\n"
+            status_msg += f"â€¢ Total Users: {user_stats[0]['total_users']}\n"
+            status_msg += f"â€¢ Active (7 days): {user_stats[0]['active_users']}\n"
+        
+        status_msg += f"\nConfiguration:\n"
+        status_msg += f"â€¢ Max ceilings per quote: {Config.MAX_CEILINGS_PER_QUOTE}\n"
+        status_msg += f"â€¢ Quote validity: {Config.QUOTE_VALIDITY_DAYS} days\n"
+        status_msg += f"â€¢ Debug mode: {'ON' if Config.DEBUG_MODE else 'OFF'}\n"
+        status_msg += f"â€¢ PDF generation: {'ON' if Config.ENABLE_PDF_GENERATION else 'OFF'}\n"
+        status_msg += f"â€¢ AI Chat: {'ON' if Config.ENABLE_AI_CHAT else 'OFF'}\n"
+        status_msg += f"â€¢ Email Sending: {'ON' if Config.ENABLE_EMAIL_SENDING else 'OFF'}\n"
+        status_msg += f"â€¢ Admin Messaging: ✅ Available\n"
+        status_msg += f"â€¢ Perimeter Editing: ✅ Enabled\n"
+        status_msg += f"â€¢ Quote Editing: ✅ Enhanced with conversation handler\n"
+        status_msg += f"â€¢ User Management: ✅ Active\n"
+        status_msg += f"â€¢ User Onboarding: ✅ Enabled\n"
+        status_msg += f"â€¢ Dynamics 365 Sync: {'✅ Active' if Config.ENABLE_DYNAMICS_SYNC else 'âŒ Disabled'}\n\n"
+        status_msg += f"✅ All systems operational! User management active. Dynamics 365 integrated.\n"
+        
+        # Send without parse_mode to avoid Markdown issues
+        await update.message.reply_text(status_msg)
+    
+    def _get_uptime(self):
+        """Calculate bot uptime"""
+        if hasattr(self, 'start_time'):
+            uptime = datetime.now() - self.start_time
+            days = uptime.days
+            hours, remainder = divmod(uptime.seconds, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            
+            parts = []
+            if days:
+                parts.append(f"{days}d")
+            if hours:
+                parts.append(f"{hours}h")
+            if minutes:
+                parts.append(f"{minutes}m")
+            parts.append(f"{seconds}s")
+            
+            return " ".join(parts)
+        return "Unknown"
+    
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle all messages - with user management and Dynamics support"""
+        user_id = update.effective_user.id
+        message_text = update.message.text
+        
+        # Log incoming message for debugging
+        logger.debug(f"Received message from {user_id}: {message_text}")
+        
+        # Check if we're in an active conversation handler
+        # This is important - conversation handlers should take precedence
+        
+        # PRIORITY 0: Check if admin is adding a note
+        if context.user_data.get('admin_adding_note_for'):
+            target_user_id = context.user_data['admin_adding_note_for']
+            success = self.db.add_user_note(target_user_id, message_text, user_id)
+            
+            if success:
+                await update.message.reply_text("✅ Note added successfully!")
+            else:
+                await update.message.reply_text("âŒ Failed to add note.")
+            
+            del context.user_data['admin_adding_note_for']
+            return
+        
+        # PRIORITY 0.5: Check if admin is in search mode
+        if context.user_data.get('admin_search_mode') and user_id in Config.ADMIN_USER_IDS:
+            await self.admin_user_mgmt.handle_search_input(update, context)
+            return
+        
+        # Check if waiting for Dynamics sync input
+        if context.user_data.get('awaiting_dynamics_user_id'):
+            try:
+                user_id_to_sync = int(message_text)
+                await update.message.reply_text(f"ðŸ”„ Syncing user {user_id_to_sync}...")
+                success, message = await self.dynamics_integration.manual_sync_user(user_id_to_sync)
+                await update.message.reply_text(f"{'✅' if success else 'âŒ'} {message}")
+            except ValueError:
+                await update.message.reply_text("âŒ Invalid user ID. Please enter a number.")
+            
+            del context.user_data['awaiting_dynamics_user_id']
+            return
+        
+        if context.user_data.get('awaiting_dynamics_quote_id'):
+            try:
+                quote_id_to_sync = int(message_text)
+                await update.message.reply_text(f"ðŸ”„ Syncing quote {quote_id_to_sync}...")
+                success, message = await self.dynamics_integration.manual_sync_quote(quote_id_to_sync)
+                await update.message.reply_text(f"{'✅' if success else 'âŒ'} {message}")
+            except ValueError:
+                await update.message.reply_text("âŒ Invalid quote ID. Please enter a number.")
+            
+            del context.user_data['awaiting_dynamics_quote_id']
+            return
+        
+        # Handle Dynamics menu selections
+        if context.user_data.get('admin_dynamics_menu'):
+            await self.handle_dynamics_menu_selection(update, context)
+            return
+        
+        # PRIORITY 1: Check for active quote creation session
+        session = self.db.get_quote_session(user_id)
+        if session:
+            logger.info(f"User {user_id} has active quote session")
+            await self.quote_flow.handle_message(update, context)
+            return
+        
+        # PRIORITY 2: Check for admin menu selections including Dynamics
+        if user_id in Config.ADMIN_USER_IDS and message_text in [
+            "📨 Send Messages", "📊 View Statistics", "👥 User Management", 
+            "📊 Dynamics 365 Sync", "🔧 System Diagnostics", "❌ Exit Admin Mode",
+            "📋 List All Users", "🔍 Search Users", "📊 User Statistics",
+            "👥 User Groups", "📤 Export User Data", "🏷️ Manage Tags",
+            "⬅️ Back to Admin Menu", "Search by Name", "Search by Email",
+            "Search by Company", "Search by Phone", "Show Companies Only",
+            "Show B2B Users", "Show Active Users", "Show With Quotes",
+            "🔄 Sync Pending Items", "🔍 View Sync Errors", "👤 Sync Specific User",
+            "🔄 Sync Specific Quote", "🔄 Force Full Sync"
+        ]:
+            # Exit AI chat mode if active
+            if context.user_data.get("ai_chat_mode", False):
+                context.user_data["ai_chat_mode"] = False
+                logger.info(f"Exiting AI chat mode for admin command: {message_text}")
+            
+            await self.handle_admin_menu(update, context)
+            return
+        
+        # PRIORITY 3: Check if message is a command
+        if message_text.startswith("/"):
+            if context.user_data.get("ai_chat_mode", False):
+                context.user_data["ai_chat_mode"] = False
+                logger.info(f"Exiting AI chat mode for command: {message_text}")
+            return
+        
+        # PRIORITY 4: Check if in AI chat mode
+        if Config.ENABLE_AI_CHAT and context.user_data.get("ai_chat_mode", False):
+            logger.info(f"User {user_id} is in AI chat mode")
+            await self.conversational_handler.handle_ai_response(update, context)
+            return
+        
+        # PRIORITY 5: Default response
+        logger.info(f"No active session for user {user_id}, showing default message")
+        
+        keyboard = [
+            [InlineKeyboardButton("📋 Create Quote", callback_data="cmd_create_quote")],
+            [InlineKeyboardButton("📊 View Quotes", callback_data="cmd_quotes")],
+            [InlineKeyboardButton("ðŸ¤– Ask AI Assistant", callback_data="cmd_ask_ai")],
+            [InlineKeyboardButton("ðŸ‘¤ My Profile", callback_data="cmd_profile")],
+            [InlineKeyboardButton("â“ Help", callback_data="cmd_help")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "ðŸ‘‹ Hi! I'm your intelligent assistant.\n\n"
+            "What would you like to do?",
+            reply_markup=reply_markup
+        )
+    
+    async def handle_inline_commands(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle inline button commands - includes profile"""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = query.from_user.id
+        
+        # Check for active quote session
+        session = self.db.get_quote_session(user_id)
+        
+        if query.data == "cmd_create_quote":
+            if session:
+                await query.message.reply_text(
+                    "âš ï¸ You already have an active quote creation session.\n"
+                    "Please complete or cancel it first.\n\n"
+                    "Use /cancel to end the current session."
+                )
+            else:
+                await self.create_quote_command(update, context)
+        
+        elif query.data == "cmd_quotes":
+            if session:
+                # Warn about active session but still show quotes
+                await query.message.reply_text(
+                    "âš ï¸ Note: You have an active quote creation session.\n"
+                    "Showing your existing quotes..."
+                )
+            await self.quotes_command(update, context)
+        
+        elif query.data == "cmd_ask_ai":
+            if session:
+                await query.message.reply_text(
+                    "âš ï¸ You have an active quote session. "
+                    "You can still use the AI assistant, but consider completing your quote first."
+                )
+            await self.ask_question_command(update, context)
+        
+        elif query.data == "cmd_profile":
+            await self.profile_command(update, context)
+        
+        elif query.data == "cmd_help":
+            await self.help_command(update, context)
+    
+    async def shutdown(self, application):
+        """Cleanup on shutdown"""
+        if self.dynamics_sync_task and not self.dynamics_sync_task.done():
+            logger.info("Stopping Dynamics 365 sync task...")
+            self.dynamics_sync_task.cancel()
+            try:
+                await self.dynamics_sync_task
+            except asyncio.CancelledError:
+                pass
+        logger.info("Shutdown complete")
+    
+    def run(self):
+        """Run the enhanced bot with user management, fixed quote editing, and Dynamics 365"""
+        logger.info("ðŸš€ Starting Enhanced Multi-Ceiling Bot v8.7 with USER MANAGEMENT & DYNAMICS 365...")
+        logger.info("âœ¨ COMPLETE USER PROFILES + ONBOARDING + AI MEMORY + ADMIN MANAGEMENT + FIXED QUOTE EDITING + DYNAMICS 365!")
+        logger.info(
+            "ðŸ“¦ Features: Multi-ceiling quotes, AI Chat, Quote Management, PDF Generation, ENTRA ID EMAIL, ADMIN MESSAGING, PERIMETER EDIT, USER MANAGEMENT, DYNAMICS 365"
+        )
+        logger.info("ðŸ”’ Security: Token redaction enabled")
+        logger.info("🔧 Email Service: ENTRA ID (Microsoft Graph API) - Quotes sent via Microsoft")
+        logger.info("ðŸ¤– AI Service: ENHANCED - With user memory and personalization")
+        logger.info("ðŸ‘” Admin System: ENABLED - Full admin control panel with user management")
+        logger.info("ðŸ‘¤ User Management: ENABLED - Complete profiles and onboarding")
+        logger.info("ðŸ§  AI Memory: ENABLED - Personalized conversations")
+        logger.info("ðŸ‘¥ Admin User Mgmt: ENABLED - Full user control")
+        logger.info("ðŸ“„ PDF Generator: STRETCH branded templates")
+        logger.info("📊 Dynamics 365: ENABLED - Bidirectional sync active")
+        logger.info("âœ¨ NEW: Manual perimeter editing for complex room shapes")
+        logger.info("âœ¨ NEW: Complete user profiles with onboarding flow")
+        logger.info("âœ¨ NEW: AI remembers users and personalizes responses")
+        logger.info("âœ¨ NEW: Dynamics 365 CRM integration with bidirectional sync")
+        logger.info("âœ¨ FIXED: Quote editing with proper conversation handler")
+        logger.info("âœ¨ FIXED: Profile editing maintains state correctly")
+        logger.info("âœ¨ FIXED: Handle both messages and callback queries")
+        
+        if Config.ENABLE_DYNAMICS_SYNC:
+            logger.info("📊 Dynamics 365: ENABLED - Bidirectional sync active")
+            logger.info("  - Users sync to Contacts/Accounts")
+            logger.info("  - Quotes sync bidirectionally")
+            logger.info("  - Background sync every 5 minutes")
+        
+        try:
+            # Validate configuration
+            Config.validate_config()
+            
+            # Test database and create admin tables
+            if not self.db.test_connection():
+                logger.error("âŒ Cannot connect to database!")
+                return
+            
+            # Add admin messaging tables
+            add_admin_messaging_tables(self.db)
+            
+            # Run diagnostics
+            if Config.DEBUG_MODE:
+                self.db.run_diagnostics()
+            
+            # Create application
+            application = Application.builder().token(Config.BOT_TOKEN).build()
+            
+            # Make bot components accessible to handlers
+            application.bot_data['quote_editor'] = self.quote_editor
+            application.bot_data['quote_flow'] = self.quote_flow
+            application.bot_data['db'] = self.db
+            application.bot_data['email_sender'] = self.email_sender
+            application.bot_data['pdf_generator'] = self.pdf_generator if Config.ENABLE_PDF_GENERATION else None
+            application.bot_data['dynamics_integration'] = self.dynamics_integration
+                        
+            # Add startup handler
+            async def post_init(application):
+                await self.startup_tasks()
+            
+            application.post_init = post_init
+            application.post_shutdown = self.shutdown
+            
+            # IMPORTANT: Order matters! Conversation handlers must be added before generic handlers
+            
+            # Add onboarding conversation handler FIRST with proper states
+            onboarding_handler = ConversationHandler(
+                entry_points=[
+                    CommandHandler("start", self.start_command)
+                ],
+                states={
+                    UserOnboardingHandler.ASK_FIRST_NAME: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, self.user_onboarding.ask_first_name)
+                    ],
+                    UserOnboardingHandler.ASK_LAST_NAME: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, self.user_onboarding.ask_last_name)
+                    ],
+                    UserOnboardingHandler.ASK_IS_COMPANY: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, self.user_onboarding.ask_is_company)
+                    ],
+                    UserOnboardingHandler.ASK_COMPANY_NAME: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, self.user_onboarding.ask_company_name)
+                    ],
+                    UserOnboardingHandler.ASK_VAT_NUMBER: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, self.user_onboarding.ask_vat_number)
+                    ],
+                    UserOnboardingHandler.ASK_ADDRESS: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, self.user_onboarding.ask_address)
+                    ],
+                    UserOnboardingHandler.ASK_EMAIL: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, self.user_onboarding.ask_email)
+                    ],
+                    UserOnboardingHandler.ASK_PHONE: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, self.user_onboarding.ask_phone)
+                    ],
+                    UserOnboardingHandler.CONFIRM_DATA: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, self.user_onboarding.handle_confirmation)
+                    ],
+                    UserOnboardingHandler.EDIT_FIELD: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, self.user_onboarding.handle_edit_field)
+                    ],
+                    UserOnboardingHandler.EDIT_VALUE: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, self.user_onboarding.handle_edit_value)
+                    ],
+                },
+                fallbacks=[
+                    CommandHandler("cancel", self.user_onboarding.cancel_onboarding)
+                ],
+                name="user_onboarding",
+                persistent=False,
+                per_message=False,
+                allow_reentry=True  # Allow re-entering the conversation
+            )
+            
+            application.add_handler(onboarding_handler)
+            
+            # Profile editing handler for existing users
+            profile_edit_handler = ConversationHandler(
+                entry_points=[
+                    CallbackQueryHandler(self.user_onboarding.handle_profile_callback, pattern="^edit_profile$")
+                ],
+                states={
+                    UserOnboardingHandler.EDIT_FIELD: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex("^(✅ Save Changes|âŒ Cancel)$"), self.user_onboarding.handle_profile_edit),
+                        MessageHandler(filters.Regex("^(✅ Save Changes|âŒ Cancel)$"), self.user_onboarding.handle_profile_edit)
+                    ],
+                    UserOnboardingHandler.EDIT_VALUE: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, self.user_onboarding.handle_edit_value)
+                    ],
+                },
+                fallbacks=[
+                    CommandHandler("cancel", self.user_onboarding.cancel_onboarding)
+                ],
+                name="profile_editing",
+                persistent=False,
+                per_message=False
+            )
+            
+            application.add_handler(profile_edit_handler)
+            
+            # Add quote editing conversation handler
+            quote_edit_handler = ConversationHandler(
+                entry_points=[
+                    CallbackQueryHandler(
+                        self.quote_editor.start_quote_edit,
+                        pattern="^quote_edit_\\d+$"
+                    )
+                ],
+                states={
+                    self.quote_editor.EDIT_MENU: [
+                        CallbackQueryHandler(
+                            self.quote_editor.handle_quote_callback,
+                            pattern="^(edit_|quote_)"
+                        )
+                    ],
+                    self.quote_editor.EDIT_DIMENSIONS: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                     self.quote_editor.handle_edit_input)
+                    ],
+                    self.quote_editor.EDIT_PERIMETER: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                     self.quote_editor.handle_edit_input)
+                    ],
+                    self.quote_editor.EDIT_COLOR: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                     self.quote_editor.handle_edit_input)
+                    ],
+                    self.quote_editor.EDIT_CORNERS: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                     self.quote_editor.handle_edit_input)
+                    ],
+                },
+                fallbacks=[
+                    CommandHandler("cancel", self.quote_editor.handle_cancel_edit),
+                    CallbackQueryHandler(
+                        self.quote_editor.cancel_edit,
+                        pattern="^edit_cancel_\\d+$"
+                    )
+                ],
+                name="quote_editing",
+                persistent=False,
+                per_message=False
+            )
+            
+            application.add_handler(quote_edit_handler)
+            
+            # Add admin messaging conversation handler
+            admin_conv_handler = ConversationHandler(
+                entry_points=[
+                    CommandHandler("send_message", self.admin_messaging.admin_message_command),
+                    MessageHandler(filters.Regex("^📨 Send Messages"), self.admin_messaging.admin_message_command),
+                ],
+                states={
+                    AdminMessagingSystem.MESSAGE_TYPE: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, self.admin_messaging.handle_message_type)
+                    ],
+                    AdminMessagingSystem.USER_SELECTION: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, self.admin_messaging.handle_user_selection),
+                        CallbackQueryHandler(self.admin_messaging.handle_user_selection),
+                    ],
+                    AdminMessagingSystem.MESSAGE_INPUT: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, self.admin_messaging.handle_message_input)
+                    ],
+                    AdminMessagingSystem.CONFIRMATION: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, self.admin_messaging.handle_confirmation)
+                    ],
+                },
+                fallbacks=[
+                    CommandHandler("cancel", self.admin_messaging.cancel_handler),
+                    MessageHandler(filters.Regex("^âŒ Cancel"), self.admin_messaging.cancel_handler),
+                ],
+                name="admin_messaging",
+                persistent=False,
+                per_message=False,
+            )
+            
+            application.add_handler(admin_conv_handler)
+            
+            # Add command handlers - these don't interfere with conversation handlers
+            application.add_handler(CommandHandler("profile", self.profile_command))
+            application.add_handler(CommandHandler("create_quote", self.create_quote_command))
+            application.add_handler(CommandHandler("quotes", self.quotes_command))
+            application.add_handler(CommandHandler("ask_a_question", self.ask_question_command))
+            application.add_handler(CommandHandler("help", self.help_command))
+            application.add_handler(CommandHandler("status", self.status_command))
+            application.add_handler(CommandHandler("admin", self.admin_command))
+            
+            # Add callback query handlers
+            # Profile callbacks - exclude edit_profile as it's handled by conversation handler
+            application.add_handler(CallbackQueryHandler(
+                self.user_onboarding.handle_profile_callback,
+                pattern="^(view_quotes|close_profile)$"
+            ))
+            
+            # Admin user management callbacks
+            application.add_handler(CallbackQueryHandler(
+                self.admin_user_mgmt.handle_callback_query,
+                pattern="^admin_(users_|user_|change_type_|set_type_|edit_user_|add_note_|manage_tags_|view_quotes_|view_activity_|send_msg_|export_user_|tag_add_|tag_remove_)"
+            ))
+            
+            # Quote editor callbacks (excluding those handled by conversation handler)
+            application.add_handler(CallbackQueryHandler(
+                self.quote_editor.handle_quote_callback,
+                pattern="^(quote_view_|quote_status_|status_change_|quote_pdf_|quote_email_|quote_list|quote_list_back)"
+            ))
+            
+            # Inline command callbacks
+            application.add_handler(CallbackQueryHandler(
+                self.handle_inline_commands,
+                pattern="^cmd_"
+            ))
+            
+            # Add message handler - MUST BE LAST
+            application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+            
+            # Start bot
+            logger.info("✅ Bot is running with COMPLETE USER MANAGEMENT SYSTEM & DYNAMICS 365...")
+            logger.info("ðŸ‘¤ New users will go through onboarding automatically")
+            logger.info("ðŸ“ User profiles stored with full information")
+            logger.info("ðŸ§  AI remembers conversations and learns preferences")
+            logger.info("ðŸ‘¥ Admins have full user management capabilities")
+            logger.info("📊 Dynamics 365 CRM integration active")
+            logger.info("ðŸ“ PERIMETER: Manual editing enabled for complex room shapes")
+            logger.info("âœï¸ QUOTE EDITOR: Now using proper conversation handler")
+            logger.info("✅ PRIORITY: Admin commands now work in AI chat mode")
+            logger.info("✅ QUOTE EDITING: Fixed with proper state management")
+            logger.info("✅ CALLBACK QUERIES: Now properly handled for all commands")
+            logger.info("✅ ONBOARDING: Fixed to maintain conversation state properly")
+            logger.info("✅ DYNAMICS 365: Bidirectional sync with CRM active")
+            
+            application.run_polling(allowed_updates=Update.ALL_TYPES)
+        
+        except Exception as e:
+            logger.error(f"âŒ Failed to start bot: {e}")
+            logger.error(traceback.format_exc())
+
+
+# Entry point
+if __name__ == "__main__":
+    bot = EnhancedStretchCeilingBot()
+    bot.run()

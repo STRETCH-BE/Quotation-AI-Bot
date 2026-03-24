@@ -386,12 +386,14 @@ class EnhancedMultiCeilingQuoteFlow:
         if not message:
             return
         
+        max_ceilings = Config.MAX_CEILINGS_PER_QUOTE
+        
         keyboard = [
             ["1 ceiling"],
             ["2 ceilings"],
             ["3 ceilings"],
             ["4 ceilings"],
-            ["5+ ceilings"]
+            [f"5+ ceilings (up to {max_ceilings})"]
         ]
         
         # Add back button if there are previous steps
@@ -1116,11 +1118,22 @@ class EnhancedMultiCeilingQuoteFlow:
                     count = 3
                 elif message_text.startswith("4"):
                     count = 4
-                elif message_text.startswith("5"):
-                    count = 5
+                elif message_text.startswith("5+"):
+                    # User selected 5+ ceilings - ask for exact count
+                    session_data["awaiting_5plus_count"] = True
+                    self.db.save_quote_session(session_data["user_id"], session_data, session_data["state"])
+                    
+                    await update.message.reply_text(
+                        f"🔢 **How many ceilings do you need?**\n\n"
+                        f"Please enter a number between 5 and {Config.MAX_CEILINGS_PER_QUOTE}:",
+                        reply_markup=ReplyKeyboardRemove(),
+                        parse_mode="Markdown"
+                    )
+                    return
                 else:
-                    count = 5
+                    count = 5  # Default fallback
             else:
+                # Direct number input
                 count = int(message_text)
             
             if 1 <= count <= Config.MAX_CEILINGS_PER_QUOTE:

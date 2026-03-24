@@ -15,10 +15,11 @@ import traceback
 
 from config import Config
 from utils import serialize_for_json
+from services.mail.email_session_mixin import EmailSessionMixin
 
 logger = logging.getLogger(__name__)
 
-class EnhancedDatabaseManager:
+class EnhancedDatabaseManager(EmailSessionMixin):
     """Enhanced database manager with quote management, conversation logging, admin features, and user management"""
     
     def __init__(self):
